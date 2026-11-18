@@ -966,7 +966,7 @@ final class Monitor: NSObject, NSApplicationDelegate {
         let cutoff = Date().addingTimeInterval(-26 * 3600).timeIntervalSince1970 * 1000
         let maxPages = 25
 
-        func page(_ cursor: String?, pagesLeft: Int) {
+        func page(_ cursor: String?, pagesLeft: Int, retriesLeft: Int = 3) {
             var comps = URLComponents(string: "\(base)/request-logs")
             var q = [URLQueryItem(name: "category", value: "inference"),
                      URLQueryItem(name: "limit", value: "100")]
@@ -980,15 +980,25 @@ final class Monitor: NSObject, NSApplicationDelegate {
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
             req.setValue("application/json", forHTTPHeaderField: "accept")
             URLSession.shared.dataTask(with: req) { data, resp, error in
-                if let error { hadError = true; fail("request-logs: \(error.localizedDescription)") }
+                if let error {
+                    // TLS/网络抖动重试同一页
+                    if retriesLeft > 0 {
+                        page(cursor, pagesLeft: pagesLeft, retriesLeft: retriesLeft - 1)
+                        return
+                    }
+                    hadError = true; fail("request-logs: \(error.localizedDescription)")
+                }
                 guard let data, let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
                       let r = try? JSONDecoder().decode(RequestLogsResp.self, from: data),
                       let items = r.items, !items.isEmpty else {
-                    if error == nil, !hadError {
-                        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                        if code != 0 && !(200..<300).contains(code) {
-                            fail("request-logs: HTTP \(code)")
-                        }
+                    // 5xx/429 也重试
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    if retriesLeft > 0, code >= 500 || code == 429 {
+                        page(cursor, pagesLeft: pagesLeft, retriesLeft: retriesLeft - 1)
+                        return
+                    }
+                    if error == nil, !hadError, code != 0 && !(200..<300).contains(code) {
+                        fail("request-logs: HTTP \(code)")
                     }
                     completion(collected)
                     return
@@ -1053,29 +1063,36 @@ final class Monitor: NSObject, NSApplicationDelegate {
                 return
             }
             group.enter()
-            var req = URLRequest(url: url, timeoutInterval: 20)
-            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            req.setValue("application/json", forHTTPHeaderField: "accept")
-            URLSession.shared.dataTask(with: req) { data, resp, error in
-                defer { group.leave() }
-                lock.lock(); defer { lock.unlock() }
-                if let error {
-                    apiError = apiError ?? "\(name): \(error.localizedDescription)"
-                    return
-                }
-                guard let data, let http = resp as? HTTPURLResponse else {
-                    apiError = apiError ?? "\(name): 无响应"
-                    return
-                }
-                guard (200..<300).contains(http.statusCode) else {
-                    let hint = http.statusCode == 401 ? "（Key 无效或已失效）"
-                        : (http.statusCode == 404 ? "（路径不存在，接口地址可能已变更）" : "")
-                    apiError = apiError ?? "\(name): HTTP \(http.statusCode)\(hint)"
-                    return
-                }
-                handler(data)
-                okCount += 1
-            }.resume()
+            // TLS/网络偶发抖动时自动重试；无论成败，最后一次尝试必然 group.leave()
+            func attempt(_ remaining: Int) {
+                var req = URLRequest(url: url, timeoutInterval: 20)
+                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                req.setValue("application/json", forHTTPHeaderField: "accept")
+                URLSession.shared.dataTask(with: req) { data, resp, error in
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    let success = data != nil && (200..<300).contains(code)
+                    let canRetry = remaining > 1 && (error != nil || code >= 500 || code == 429)
+                    if canRetry {
+                        attempt(remaining - 1)   // group.leave 由最后一次尝试负责
+                        return
+                    }
+                    // 终态：成功或不再重试
+                    lock.lock()
+                    if success, let data {
+                        handler(data)
+                        okCount += 1
+                    } else if let error {
+                        apiError = apiError ?? "\(name): \(error.localizedDescription)"
+                    } else {
+                        let hint = code == 401 ? "（Key 无效或已失效）"
+                            : (code == 404 ? "（路径不存在，接口地址可能已变更）" : "")
+                        apiError = apiError ?? "\(name): HTTP \(code)\(hint)"
+                    }
+                    lock.unlock()
+                    group.leave()
+                }.resume()
+            }
+            attempt(3)
         }
 
         let base = apiBase
@@ -1125,8 +1142,11 @@ final class Monitor: NSObject, NSApplicationDelegate {
                 self.goDaily = newGoDaily
                 self.goStatus = newGoStatus
                 self.goMeters = newGoStatus?.access?.meters
-                self.logs = newLogs
-                self.hourlyBuckets = self.aggregateHourly(newLogs)
+                // 日志分页拉取失败（网络抖动）时保留上一轮数据，避免小时图/请求质量整块消失
+                if !newLogs.isEmpty || self.logs.isEmpty {
+                    self.logs = newLogs
+                    self.hourlyBuckets = self.aggregateHourly(newLogs)
+                }
                 self.lastUpdated = Date()
             }
             if let mq = self.dominantModelQuota() {
@@ -1544,6 +1564,13 @@ final class Monitor: NSObject, NSApplicationDelegate {
                     ("  ·  ", .secondaryLabelColor),
                     ("失败 \(logs.count - ok) 次", logs.count - ok > 0 ? cRed : .secondaryLabelColor),
                 ], indent: 1)
+                // 成功/失败比例条（绿=成功，红=失败）
+                let ratioItem = NSMenuItem()
+                ratioItem.view = SegmentedBarView(segments: [
+                    (Double(ok), cGreen),
+                    (Double(logs.count - ok), cRed),
+                ], width: 316)
+                self.menu.addItem(ratioItem)
                 coloredText([
                     ("首字延迟 ", .labelColor), (String(format: "%.1fs", avgTTFT / 1000), cBlue),
                     ("  ·  总耗时 ", .labelColor), (String(format: "%.1fs", avgDur / 1000), cBlue),
