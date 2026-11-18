@@ -520,6 +520,142 @@ final class HourlyBarChartView: NSView {
     }
 }
 
+/// Go 用量预测折线图：绿色实线 = 已用，橙色虚线 = 线性外推，灰色虚线 = 100% 月限
+final class ForecastChartView: NSView {
+    private struct Pt { let offset: Double; let pct: Double }
+    private let series: [Pt]            // 已用累计曲线（天偏移, %）
+    private let totalDays: Double
+    private let endPct: Double
+    private let hitOffset: Double?      // 预计达到 100% 的天偏移（nil = 不会触顶）
+    private let yMax: Double
+    private let xLabels: [(offset: Double, text: String, color: NSColor)]
+
+    init(series: [(offset: Double, pct: Double)], totalDays: Double,
+         endPct: Double, hitOffset: Double?,
+         xLabels: [(offset: Double, text: String, color: NSColor)], width: CGFloat) {
+        self.series = series.map { Pt(offset: $0.offset, pct: $0.pct) }
+        self.totalDays = max(1, totalDays)
+        self.endPct = endPct
+        self.hitOffset = hitOffset
+        self.xLabels = xLabels
+        let topVal = max(115, endPct + 12)
+        self.yMax = (topVal / 50).rounded(.up) * 50    // y 轴刻度取 50 的倍数
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 108))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let leftInset: CGFloat = 34
+        let rightInset: CGFloat = 10
+        let topInset: CGFloat = 8
+        let labelH: CGFloat = 14
+        let plot = NSRect(x: leftInset, y: labelH,
+                          width: max(10, bounds.width - leftInset - rightInset),
+                          height: max(10, bounds.height - topInset - labelH))
+        func X(_ day: Double) -> CGFloat {
+            plot.minX + plot.width * CGFloat(min(max(day, 0), totalDays) / totalDays)
+        }
+        func Y(_ pct: Double) -> CGFloat {
+            plot.minY + plot.height * CGFloat(min(max(pct, 0), yMax) / yMax)
+        }
+
+        // 横向网格 + y 轴刻度（100% 用更深的虚线强调）
+        for g in stride(from: 0, through: Int(yMax), by: 50) {
+            let y = Y(Double(g))
+            let isLimit = g == 100
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: plot.minX, y: y))
+            path.line(to: NSPoint(x: plot.maxX, y: y))
+            if isLimit {
+                cOrange.withAlphaComponent(0.55).setStroke()
+                path.setLineDash([5, 4], count: 2, phase: 0)
+            } else {
+                NSColor.separatorColor.setStroke()
+            }
+            path.lineWidth = 1
+            path.stroke()
+
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 8.5),
+                .foregroundColor: isLimit ? cOrange : NSColor.secondaryLabelColor,
+            ]
+            let s = NSAttributedString(string: "\(g)%", attributes: attrs)
+            s.draw(at: NSPoint(x: plot.minX - s.size().width - 4, y: y - s.size().height / 2 + 1))
+        }
+
+        // 触顶日期的竖向虚线
+        if let ho = hitOffset {
+            let vp = NSBezierPath()
+            vp.move(to: NSPoint(x: X(ho), y: plot.minY))
+            vp.line(to: NSPoint(x: X(ho), y: plot.maxY))
+            cOrange.withAlphaComponent(0.35).setStroke()
+            vp.setLineDash([3, 3], count: 2, phase: 0)
+            vp.lineWidth = 1
+            vp.stroke()
+        }
+
+        guard let first = series.first else { return }
+
+        // 已用面积（浅绿填充）
+        if series.count >= 2 {
+            let area = NSBezierPath()
+            area.move(to: NSPoint(x: X(first.offset), y: plot.minY))
+            for p in series { area.line(to: NSPoint(x: X(p.offset), y: Y(p.pct))) }
+            area.line(to: NSPoint(x: X(series.last!.offset), y: plot.minY))
+            area.close()
+            cGreen.withAlphaComponent(0.12).setFill()
+            area.fill()
+        }
+
+        // 已用折线（深绿实线）
+        let used = NSBezierPath()
+        used.move(to: NSPoint(x: X(first.offset), y: Y(first.pct)))
+        for p in series.dropFirst() { used.line(to: NSPoint(x: X(p.offset), y: Y(p.pct))) }
+        cGreen.setStroke()
+        used.lineWidth = 2
+        used.lineCapStyle = .round
+        used.stroke()
+
+        // 预测虚线（橙）：从当前点线性外推到周期末
+        let last = series.last!
+        let forecast = NSBezierPath()
+        forecast.move(to: NSPoint(x: X(last.offset), y: Y(last.pct)))
+        if let ho = hitOffset { forecast.line(to: NSPoint(x: X(ho), y: Y(100))) }
+        forecast.line(to: NSPoint(x: X(totalDays), y: Y(endPct)))
+        cOrange.setStroke()
+        forecast.setLineDash([6, 4], count: 2, phase: 0)
+        forecast.lineWidth = 2
+        forecast.stroke()
+
+        // 当前点（绿色实心圆）+ 终点（橙色空心圆）
+        let nowCircle = NSBezierPath(ovalIn: NSRect(x: X(last.offset) - 3, y: Y(last.pct) - 3, width: 6, height: 6))
+        cGreen.setFill()
+        nowCircle.fill()
+        let endY = hitOffset != nil ? Y(100) : Y(endPct)
+        let endX = hitOffset != nil ? X(hitOffset!) : X(totalDays)
+        let endCircle = NSBezierPath(ovalIn: NSRect(x: endX - 3.5, y: endY - 3.5, width: 7, height: 7))
+        cOrange.setStroke()
+        endCircle.lineWidth = 1.5
+        endCircle.stroke()
+
+        // x 轴标签（防重叠：靠得太近的丢弃）
+        var placed: [CGFloat] = []
+        for (off, text, color) in xLabels {
+            let cx = X(off)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 8.5), .foregroundColor: color,
+            ]
+            let s = NSAttributedString(string: text, attributes: attrs)
+            let w = s.size().width
+            let x0 = min(max(cx - w / 2, plot.minX), plot.maxX - w)
+            if placed.contains(where: { abs($0 - x0) < 28 }) { continue }
+            placed.append(x0)
+            s.draw(at: NSPoint(x: x0, y: 1))
+        }
+    }
+}
+
 /// 纯展示文字行：用自定义视图承载，既不会被 AppKit 灰化，悬停也不会高亮
 final class MenuInfoView: NSView {
     init(attributed: NSAttributedString, indent: Int = 0, width: CGFloat = 340) {
@@ -576,6 +712,26 @@ final class Monitor: NSObject, NSApplicationDelegate {
         return raw.isEmpty ? Monitor.defaultConsoleURL : raw
     }
 
+    /// Console 站点根（从接口地址推导，如 https://opencode.ai）
+    private var consoleOrigin: String {
+        if let u = URL(string: apiBase), let host = u.host {
+            return "\(u.scheme ?? "https")://\(host)"
+        }
+        return "https://opencode.ai"
+    }
+
+    /// 当前组织（workspace）的 Console 根路径，如 https://opencode.ai/console/org_xxx
+    /// 由配置的网页地址裁掉 /activity、/go 等后缀得到
+    private var orgConsoleBase: String {
+        var raw = consoleURLString
+        for marker in ["/activity", "/go", "/settings"] {
+            if let r = raw.range(of: marker) { raw = String(raw[..<r.lowerBound]) }
+        }
+        while raw.hasSuffix("/") { raw = String(raw.dropLast()) }
+        if !raw.contains("/console") { raw = consoleOrigin + "/console" }
+        return raw
+    }
+
     /// 接口主机名，用于菜单里一眼确认当前指向哪儿
     private var apiHostText: String {
         URL(string: apiBase)?.host ?? apiBase
@@ -590,6 +746,97 @@ final class Monitor: NSObject, NSApplicationDelegate {
     /// 官方文档里该模型的月额度
     private func monthlyLimit(for model: String) -> Double? {
         planIsPlus ? goPlusMonthlyLimits[model] : goMonthlyLimits[model]
+    }
+
+    // MARK: Go 用量预测（复刻官网 Forecast：累计曲线 + 线性外推）
+
+    struct Forecast {
+        var pctNow: Double                    // 当前已用 %
+        var avgPerDay: Double                 // 日均 %/天
+        var totalDays: Double
+        var endPct: Double                    // 周期末预计 %
+        var hitDate: Date?                    // 预计达到 100% 的日期（不会触顶则 nil）
+        var series: [(offset: Double, pct: Double)]
+        var xLabels: [(offset: Double, text: String, color: NSColor)]
+    }
+
+    private func parseDay(_ s: String?) -> Date? {
+        guard let s, !s.isEmpty else { return nil }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.timeZone = TimeZone(identifier: "UTC")
+        if let d = f.date(from: s) { return d }
+        return parseISO(s)
+    }
+
+    /// 口径：goDaily 是列表价；月额度 meter 是 allowance。用两者比值反推换算系数，
+    /// 保证累计曲线终点与 meter 完全一致（官网同口径）
+    private func buildForecast() -> Forecast? {
+        guard let start = parseISO(goStatus?.access?.startsAt),
+              let end = parseISO(goStatus?.access?.endsAt),
+              end > start,
+              let meter = goMeters?.month,
+              let limitUSD = Double(meter.limitMicroCents ?? ""), limitUSD > 0 else { return nil }
+        let usedAllowance = Double(meter.usedMicroCents ?? "") ?? 0
+
+        let totalDays = end.timeIntervalSince(start) / 86400
+        let now = Date()
+        let elapsed = min(totalDays, max(1, now.timeIntervalSince(start) / 86400))
+
+        // 周期内每日花费（列表价 USD）
+        let cycleDaily = goDaily.compactMap { d -> (Date, Double)? in
+            guard let dt = parseDay(d.date), dt >= start, dt < end else { return nil }
+            return (dt, Double(toInt(d.totalCostMicroCents)) / 1e8)
+        }.sorted { $0.0 < $1.0 }
+        let totalList = cycleDaily.reduce(0.0) { $0 + $1.1 }
+
+        // allowance / 列表价$ 换算系数：优先用 meter 反推（自洽），否则按主用模型官方月限
+        let factor: Double
+        if totalList > 0 {
+            factor = usedAllowance / totalList
+        } else if let mq = dominantModelQuota() {
+            factor = 60.0 / mq.monthLimit
+        } else {
+            return nil
+        }
+
+        // 累计百分比曲线
+        var series: [(offset: Double, pct: Double)] = []
+        var cum = 0.0
+        for (dt, cost) in cycleDaily {
+            cum += cost * factor
+            let off = max(0, dt.timeIntervalSince(start) / 86400)
+            series.append((off, cum / limitUSD * 100))
+        }
+        if series.isEmpty {
+            series = [(elapsed, usedAllowance / limitUSD * 100)]
+        }
+
+        let pctNow = series.last!.pct
+        let avg = pctNow / elapsed
+        let endPct = avg * totalDays
+        var hitDate: Date?
+        if pctNow < 100, avg > 0 {
+            let hit = now.addingTimeInterval((100 - pctNow) / avg * 86400)
+            if hit <= end { hitDate = hit }
+        }
+
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        f.timeZone = .current
+        var labels: [(Double, String, NSColor)] = [(0, f.string(from: start), NSColor.secondaryLabelColor)]
+        // 今日标签与两端太近时会遮挡，留出边距
+        if elapsed > 3, totalDays - elapsed > 3 {
+            labels.append((elapsed, f.string(from: now), cGreen))
+        }
+        if let hd = hitDate {
+            labels.append((totalDays, f.string(from: hd), cOrange))
+        } else {
+            labels.append((totalDays, f.string(from: end), NSColor.secondaryLabelColor))
+        }
+
+        return Forecast(pctNow: pctNow, avgPerDay: avg, totalDays: totalDays,
+                        endPct: endPct, hitDate: hitDate, series: series, xLabels: labels)
     }
 
     /// 主用模型（30 天花费占比 ≥ 80%）及其官方月额度；混合使用时返回 nil（回退账户计量）
@@ -1160,6 +1407,56 @@ final class Monitor: NSObject, NSApplicationDelegate {
                 }
             }
 
+            // 4.5) Go 用量预测（官网 Forecast 同款：线性外推 + 触顶日期）
+            if let fc = buildForecast() {
+                sep()
+                infoItem(NSAttributedString(string: "Go 用量预测（Forecast）", attributes: [
+                    .font: NSFont.menuFont(ofSize: 12), .foregroundColor: NSColor.labelColor,
+                ]))
+                coloredText([
+                    ("当前 ", .labelColor),
+                    (String(format: "%.0f%%", fc.pctNow), cBlue),
+                    ("  ·  日均 ", .labelColor),
+                    (String(format: "%.1f%%/天", fc.avgPerDay), cBlue),
+                    ("  ·  周期末约 ", .labelColor),
+                    (String(format: "%.0f%%", fc.endPct), fc.endPct >= 100 ? cOrange : cGreen),
+                ])
+                let f = DateFormatter()
+                f.dateFormat = "MM-dd"
+                if let hd = fc.hitDate {
+                    coloredText([
+                        ("按当前速度 ", .labelColor),
+                        ("\(f.string(from: hd)) 达到 100%", cOrange),
+                        ("（剩 \(fmtDuration(hd.timeIntervalSinceNow))）", NSColor.secondaryLabelColor),
+                    ], indent: 1)
+                } else if fc.endPct < 100 {
+                    coloredText([("按当前速度本周期额度充足，不会触顶", cGreen)], indent: 1)
+                } else {
+                    coloredText([("额度已达上限", cRed)], indent: 1)
+                }
+                let hitOffset: Double?
+                if let hd = fc.hitDate, let st = parseISO(goStatus?.access?.startsAt) {
+                    hitOffset = max(0, min(fc.totalDays, hd.timeIntervalSince(st) / 86400))
+                } else {
+                    hitOffset = nil
+                }
+                let chartItem = NSMenuItem()
+                chartItem.view = ForecastChartView(
+                    series: fc.series,
+                    totalDays: fc.totalDays,
+                    endPct: fc.endPct,
+                    hitOffset: hitOffset,
+                    xLabels: fc.xLabels,
+                    width: 316
+                )
+                self.menu.addItem(chartItem)
+                coloredText([
+                    ("■ 已用", cGreen), ("   ", .labelColor),
+                    ("■ 预测", cOrange), ("   ", .labelColor),
+                    ("┄ 月限 100%", NSColor.secondaryLabelColor),
+                ], indent: 1)
+            }
+
             // 5) 模型明细（每档一个子菜单）
             sep()
             let modelParent = NSMenuItem(title: "模型明细", action: nil, keyEquivalent: "")
@@ -1319,7 +1616,22 @@ final class Monitor: NSObject, NSApplicationDelegate {
             revealItem.target = self
             connSub.addItem(revealItem)
 
-            addAction("打开 Console 网页", action: #selector(openConsole), key: "o")
+            // 官网入口（从配置的网页地址自动推导，换组织后无需改代码）
+            let webSub = makeMenu()
+            let webParent = NSMenuItem(title: "官网入口", action: nil, keyEquivalent: "")
+            webParent.submenu = webSub
+            self.menu.addItem(webParent)
+            func webLink(_ title: String, _ action: Selector, _ url: String) {
+                let it = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                it.target = self
+                it.toolTip = url
+                webSub.addItem(it)
+            }
+            webLink("用量活动页（Activity）", #selector(openConsoleActivity), orgConsoleBase + "/activity")
+            webLink("用量总览（Overview）", #selector(openConsole), consoleURLString)
+            webLink("用量明细（Usage）", #selector(openConsoleUsage), orgConsoleBase + "/activity/usage")
+            webLink("Go 额度页（Go）", #selector(openConsoleGo), consoleOrigin + "/console/go")
+
             addAction("开机自启动", action: #selector(toggleLaunchAtLogin), key: "",
                       state: launchAgentExists() ? .on : .off)
             sep()
@@ -1333,6 +1645,24 @@ final class Monitor: NSObject, NSApplicationDelegate {
         if let url = URL(string: consoleURLString) {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func openURLString(_ s: String) {
+        if let url = URL(string: s) { NSWorkspace.shared.open(url) }
+    }
+
+    // MARK: 官网快捷入口
+
+    @objc private func openConsoleActivity() {
+        openURLString(orgConsoleBase + "/activity")
+    }
+
+    @objc private func openConsoleUsage() {
+        openURLString(orgConsoleBase + "/activity/usage")
+    }
+
+    @objc private func openConsoleGo() {
+        openURLString(consoleOrigin + "/console/go")
     }
 
     // MARK: 连接设置
