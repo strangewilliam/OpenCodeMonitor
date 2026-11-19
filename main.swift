@@ -893,7 +893,7 @@ final class Monitor: NSObject, NSApplicationDelegate {
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             config = try JSONDecoder().decode(Config.self, from: data)
-            logLine("配置已加载 base=\(apiBase) key=\(maskedKey)")
+            logLine("配置已加载 base=\(apiBase) key=\(maskedKey) 刷新间隔=\(intervalLabel)")
         } catch {
             lastError = "配置文件解析失败：\(error.localizedDescription)（可在「连接设置…」重填）"
         }
@@ -947,12 +947,71 @@ final class Monitor: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: 刷新间隔（可在菜单栏「连接设置 → 修改刷新间隔」里随时改）
+
+    /// 统一口径：范围 60 秒 ~ 24 小时
+    private var currentIntervalSeconds: Int {
+        min(max(config?.refreshIntervalSeconds ?? 300, 60), 86400)
+    }
+
+    private var intervalLabel: String {
+        let s = currentIntervalSeconds
+        return s % 60 == 0 ? "\(s / 60) 分钟" : "\(s) 秒"
+    }
+
+    private let intervalPresets: [Int] = [60, 120, 180, 300, 600, 900, 1800, 3600]
+
+    /// 立即应用新的刷新间隔：写盘 → 重排定时器 → 刷新菜单 → 拉一次数据
+    private func applyRefreshInterval(_ seconds: Int) {
+        let clamped = min(max(seconds, 60), 86400)
+        let cfg = Config(apiKey: config?.apiKey ?? "",
+                         refreshIntervalSeconds: clamped,
+                         consoleURL: config?.consoleURL,
+                         apiBaseURL: config?.apiBaseURL)
+        guard saveConfigToDisk(cfg) else {
+            showInfo("保存失败", lastError ?? "无法写入配置文件")
+            return
+        }
+        config = cfg
+        scheduleTimer()
+        rebuildMenu()
+        refresh()
+        logLine("刷新间隔已改为 \(intervalLabel)")
+    }
+
+    @objc private func chooseRefreshInterval(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        applyRefreshInterval(n.intValue)
+    }
+
+    @objc private func customRefreshInterval() {
+        let alert = NSAlert()
+        alert.messageText = "自定义刷新间隔"
+        alert.informativeText = "输入分钟数（1 ~ 1440，即 1 分钟 ~ 24 小时）。设置后立即生效。"
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 160, height: 24))
+        tf.stringValue = "\(max(1, currentIntervalSeconds / 60))"
+        tf.isBezeled = true
+        tf.bezelStyle = .roundedBezel
+        tf.isEditable = true
+        tf.isSelectable = true
+        alert.accessoryView = tf
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let t = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let minutes = Int(t), (1...1440).contains(minutes) else {
+            showInfo("数值无效", "请输入 1 ~ 1440 之间的整数分钟。")
+            return
+        }
+        applyRefreshInterval(minutes * 60)
+    }
+
     // MARK: 刷新
 
     private func scheduleTimer() {
-        let interval = TimeInterval(config?.refreshIntervalSeconds ?? 300)
+        let interval = TimeInterval(currentIntervalSeconds)
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: max(60, interval), repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -1627,8 +1686,30 @@ final class Monitor: NSObject, NSApplicationDelegate {
             self.menu.addItem(connParent)
             coloredText([("接口地址 ", .labelColor), (apiBase, cBlue)], into: connSub)
             coloredText([("API Key ", .labelColor), (maskedKey, .labelColor)], into: connSub)
-            coloredText([("刷新间隔 ", .labelColor),
-                         ("\(max(60, config?.refreshIntervalSeconds ?? 300) / 60) 分钟", .labelColor)], into: connSub)
+            coloredText([("刷新间隔 ", .labelColor), (intervalLabel, cBlue)], into: connSub)
+            connSub.addItem(.separator())
+
+            // 刷新间隔快捷切换：常用档位打勾直选，点一下立即生效
+            let intervalSub = makeMenu()
+            let intervalParent = NSMenuItem(title: "修改刷新间隔", action: nil, keyEquivalent: "")
+            intervalParent.submenu = intervalSub
+            connSub.addItem(intervalParent)
+            for s in intervalPresets {
+                let mins = s / 60
+                let it = NSMenuItem(title: "\(mins) 分钟", action: #selector(chooseRefreshInterval(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = NSNumber(value: s)
+                it.state = s == currentIntervalSeconds ? .on : .off
+                intervalSub.addItem(it)
+            }
+            intervalSub.addItem(.separator())
+            let isPreset = intervalPresets.contains(currentIntervalSeconds)
+            let customTitle = isPreset ? "自定义…" : "自定义…（当前 \(intervalLabel)）"
+            let customItem = NSMenuItem(title: customTitle, action: #selector(customRefreshInterval), keyEquivalent: "")
+            customItem.target = self
+            customItem.state = isPreset ? .off : .on
+            intervalSub.addItem(customItem)
+
             connSub.addItem(.separator())
             let editItem = NSMenuItem(title: "修改接口地址 / API Key…", action: #selector(showSettings), keyEquivalent: ",")
             editItem.target = self
@@ -1735,11 +1816,11 @@ final class Monitor: NSObject, NSApplicationDelegate {
         let keyField = makeRow("API Key", config?.apiKey ?? "", rowH * 3, placeholder: "oc_sk_…")
         let baseField = makeRow("接口地址", apiBase, rowH * 2, placeholder: Monitor.defaultAPIBase)
         let consoleField = makeRow("网页地址", config?.consoleURL ?? Monitor.defaultConsoleURL, rowH * 1)
-        let intervalField = makeRow("刷新间隔(秒)", "\(max(60, config?.refreshIntervalSeconds ?? 300))", 0)
+        let intervalField = makeRow("刷新间隔(秒)", "\(currentIntervalSeconds)", 0)
 
         let alert = NSAlert()
         alert.messageText = "连接设置"
-        alert.informativeText = "接口地址变了、或者换了 API Key，在这里改就行，保存后立即生效，不需要重新编译。"
+        alert.informativeText = "接口地址变了、或者换了 API Key，在这里改就行，保存后立即生效，不需要重新编译。\n刷新间隔可在此按秒精确设置；菜单栏「连接设置 → 修改刷新间隔」有常用档位，点一下即可切换。"
         alert.accessoryView = container
         alert.addButton(withTitle: "保存并刷新")
         alert.addButton(withTitle: "取消")
