@@ -241,6 +241,13 @@ func fmtUSD(_ v: Double) -> String {
     return String(format: "$%.2f", v)
 }
 
+/// 柱状图顶部数字用：不带 $ 符号，节省窄柱上方的横向空间
+func fmtPlainAmount(_ v: Double) -> String {
+    if v == 0 { return "0" }
+    if abs(v) < 0.01 { return String(format: "%.4f", v) }
+    return String(format: "%.2f", v)
+}
+
 func fmtTokens(_ s: String?) -> String { fmtTokens(toInt(s)) }
 
 func fmtTokens(_ v: Int64) -> String {
@@ -1354,7 +1361,7 @@ final class Monitor: NSObject, NSApplicationDelegate {
             // 3) 逐日趋势（activity/go，覆盖整个计费周期）
             if goDaily.count > 0 {
                 sep()
-                infoItem(NSAttributedString(string: "每日花费 Cost（计费周期内 \(goDaily.count) 天）", attributes: [
+                infoItem(NSAttributedString(string: "每日花费 · 列表价（计费周期内 \(goDaily.count) 天）", attributes: [
                     .font: NSFont.menuFont(ofSize: 12), .foregroundColor: NSColor.labelColor,
                 ]))
                 let recent = Array(goDaily.suffix(14))
@@ -1363,7 +1370,7 @@ final class Monitor: NSObject, NSApplicationDelegate {
                     days: recent.map { d in
                         let label = String((d.date ?? "").suffix(5))   // MM-DD
                         let cost = Double(toInt(d.totalCostMicroCents)) / 1e8
-                        return (label, cost, fmtUSD(cost))
+                        return (label, cost, fmtPlainAmount(cost))
                     },
                     width: 316
                 )
