@@ -411,11 +411,11 @@ final class SegmentedBarView: NSView {
 
 /// 逐日柱状图（近 N 天）
 final class DailyBarChartView: NSView {
-    private struct Day { let label: String; let value: Double; let requests: Int64 }
+    private struct Day { let label: String; let value: Double; let topText: String }
     private let days: [Day]
 
-    init(days: [(label: String, value: Double, requests: Int64)], width: CGFloat) {
-        self.days = days.map { Day(label: $0.label, value: $0.value, requests: $0.requests) }
+    init(days: [(label: String, value: Double, topText: String)], width: CGFloat) {
+        self.days = days.map { Day(label: $0.label, value: $0.value, topText: $0.topText) }
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 64))
     }
 
@@ -450,8 +450,8 @@ final class DailyBarChartView: NSView {
             let size = s.size()
             s.draw(at: NSPoint(x: x + (barW - size.width) / 2, y: 0))
 
-            // 数值恒定绘制：柱高已预留数值行空间，不会再被挤掉
-            let s2 = NSAttributedString(string: fmtCount(d.requests), attributes: attrs)
+            // 数值恒定绘制：柱高与顶部数字统一为 cost 口径
+            let s2 = NSAttributedString(string: d.topText, attributes: attrs)
             let size2 = s2.size()
             let ty = y + h + 1
             if ty + size2.height <= bounds.height - 0.5 {
@@ -1354,7 +1354,7 @@ final class Monitor: NSObject, NSApplicationDelegate {
             // 3) 逐日趋势（activity/go，覆盖整个计费周期）
             if goDaily.count > 0 {
                 sep()
-                infoItem(NSAttributedString(string: "每日用量（计费周期内 \(goDaily.count) 天）", attributes: [
+                infoItem(NSAttributedString(string: "每日花费 Cost（计费周期内 \(goDaily.count) 天）", attributes: [
                     .font: NSFont.menuFont(ofSize: 12), .foregroundColor: NSColor.labelColor,
                 ]))
                 let recent = Array(goDaily.suffix(14))
@@ -1362,7 +1362,8 @@ final class Monitor: NSObject, NSApplicationDelegate {
                 chartItem.view = DailyBarChartView(
                     days: recent.map { d in
                         let label = String((d.date ?? "").suffix(5))   // MM-DD
-                        return (label, Double(toInt(d.totalCostMicroCents)) / 1e8, toInt(d.totalRequests))
+                        let cost = Double(toInt(d.totalCostMicroCents)) / 1e8
+                        return (label, cost, fmtUSD(cost))
                     },
                     width: 316
                 )
